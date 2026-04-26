@@ -2,6 +2,12 @@
 
 Cloudflare Worker üzerinde çalışan basit bir “piyasa verisi” API’si. Döviz ve altın (şu an aktif iki varlık tipi) verisini dış kaynaktan çekip normalize eder, **D1** veritabanına yazar ve API üzerinden en güncel kaydı döner.
 
+## Canlı ortam (deploy) adresi
+
+Bu projeyi canlıda sorgulamak için:
+
+- Base URL: `https://chanfana-openapi-template.tahadogan-business.workers.dev`
+
 ## API akışı (istek gelince ne oluyor?)
 
 Uygulama girişi `src/index.ts` içindeki `fetch` fonksiyonudur.
@@ -83,3 +89,24 @@ curl -s "http://localhost:8787/sync/altinkaynak_currency" | jq .
 ```
 
 > Lokal port `wrangler dev` konfigürasyonuna göre değişebilir.
+
+## Canlı ortamda tam URL örnekleri (döviz + altın)
+
+> Not: Altın “gram” gibi ürünlerin `code` değeri kaynağa göre değişebilir. Önce `/assets/gold` ile kodu öğrenip sonra tek-varlık endpoint’ini çağırın.
+
+### Döviz (USD/EUR)
+
+- Tüm kurlar: `https://chanfana-openapi-template.tahadogan-business.workers.dev/assets/currency`
+- Sadece Altınkaynak kaynağı: `https://chanfana-openapi-template.tahadogan-business.workers.dev/assets/currency?source=altinkaynak_currency`
+- Tek döviz (USD): `https://chanfana-openapi-template.tahadogan-business.workers.dev/assets/currency/USD`
+- Tek döviz geçmişi (USD): `https://chanfana-openapi-template.tahadogan-business.workers.dev/assets/currency/USD/history?limit=30`
+- Tek döviz (EUR): `https://chanfana-openapi-template.tahadogan-business.workers.dev/assets/currency/EUR`
+
+### Altın (gram dahil)
+
+- Tüm altın ürünleri: `https://chanfana-openapi-template.tahadogan-business.workers.dev/assets/gold`
+- Sadece Altınkaynak kaynağı: `https://chanfana-openapi-template.tahadogan-business.workers.dev/assets/gold?source=altinkaynak_gold`
+- “Gram altın” kodunu bulma: `https://chanfana-openapi-template.tahadogan-business.workers.dev/assets/gold` (çıktıda `code` alanına bakın)
+- Tek altın ürünü (örnek code ile): `https://chanfana-openapi-template.tahadogan-business.workers.dev/assets/gold/XAU_GRAM`
+- Tek altın ürünü geçmişi (örnek code ile): `https://chanfana-openapi-template.tahadogan-business.workers.dev/assets/gold/XAU_GRAM/history?limit=30`
+
