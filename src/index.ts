@@ -17,8 +17,27 @@
 
 // ─── Router ─────────────────────────────────────────────────────────────────
 
+type Env = {
+  DB: any;
+};
+
+type ProviderRecord = {
+  assetType: string;
+  source: string;
+  code: string;
+  name?: string;
+  price: number | null;
+  priceDate?: string;
+  extra?: unknown;
+};
+
+type Provider = {
+  meta: () => { id: string; name: string; assetTypes: string[]; url: string };
+  fetch: (env: Env) => Promise<ProviderRecord[]>;
+};
+
 export default {
-	async fetch(request, env, ctx) {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
 	  try {
 		return await route(request, env);
 	  } catch (err) {
@@ -27,14 +46,13 @@ export default {
 	  }
 	},
   
-	// Cron tetikleyici — wrangler.toml'da tanımlanacak
-	// [triggers] crons = ["0 6 * * 1-5"]   (hafta içi 06:00 UTC)
-	async scheduled(event, env, ctx) {
+	// Cron tetikleyici — wrangler.jsonc içinde `triggers.crons` ile tanımlı
+	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
 	  ctx.waitUntil(syncAll(env));
 	}
   };
   
-  async function route(request, env) {
+  async function route(request: Request, env: Env) {
 	const url  = new URL(request.url);
 	const path = url.pathname.replace(/\/$/, "") || "/";
 	const segments = path.split("/").filter(Boolean); // ["assets","currency","USD"]
@@ -84,7 +102,7 @@ export default {
   //
   // Yeni bir kaynak eklemek için sadece buraya yeni bir obje ekleyin.
   
-  const PROVIDERS = {
+  const PROVIDERS: Record<string, Provider> = {
 
 	// ── Altınkaynak: Döviz Kurları ───────────────────────────────────────────
 	//
@@ -98,7 +116,7 @@ export default {
 		url: "https://static.altinkaynak.com/public/Currency"
 	  }),
 
-	  fetch: async (env) => {
+	  fetch: async (env: Env) => {
 		const res = await fetchUrl("https://static.altinkaynak.com/public/Currency");
 		const items = (await res.json()) as any[];
 
@@ -138,7 +156,7 @@ export default {
 		url: "https://static.altinkaynak.com/public/Gold"
 	  }),
 
-	  fetch: async (env) => {
+	  fetch: async (env: Env) => {
 		const res = await fetchUrl("https://static.altinkaynak.com/public/Gold");
 		const items = (await res.json()) as any[];
 		const priceDate = todayISO();
@@ -198,22 +216,23 @@ export default {
   
   // ─── Sync İşlemleri ──────────────────────────────────────────────────────────
   
-  async function syncAll(env) {
+  async function syncAll(env: Env) {
 	await ensureTables(env);
-	const results = {};
+	const results: Record<string, any> = {};
   
 	for (const [id, provider] of Object.entries(PROVIDERS)) {
 	  try {
 		results[id] = await runProvider(env, provider);
 	  } catch (err) {
-		results[id] = { success: false, error: err.message };
+		const msg = err instanceof Error ? err.message : String(err);
+		results[id] = { success: false, error: msg };
 	  }
 	}
   
 	return { success: true, results };
   }
   
-  async function syncOne(env, type) {
+  async function syncOne(env: Env, type: string) {
 	await ensureTables(env);
   
 	// type → "altinkaynak_currency" gibi bir source ID olabilir,
@@ -226,7 +245,7 @@ export default {
 	}
   
 	if (byType.length) {
-	  const results = {};
+	  const results: Record<string, any> = {};
 	  for (const p of byType) {
 		results[p.meta().id] = await runProvider(env, p);
 	  }
@@ -236,25 +255,28 @@ export default {
 	return jsonError(`Unknown type or source: ${type}`, 400);
   }
   
-  async function runProvider(env, provider) {
+  async function runProvider(env: Env, provider: Provider) {
 	const records = await provider.fetch(env);
 	let saved = 0, skipped = 0;
+	const priceTs = nowIsoHour();
+	const priceDate = priceTs.slice(0, 10);
   
 	for (const r of records) {
 	  if (!r.price && r.price !== 0) { skipped++; continue; }
   
 	  await env.DB.prepare(`
-		INSERT INTO asset_prices (asset_type, source, code, name, price, price_date, extra)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(asset_type, source, code, price_date)
+		INSERT INTO asset_prices_hourly (asset_type, source, code, name, price, price_date, price_ts, extra)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(asset_type, source, code, price_ts)
 		DO UPDATE SET
 		  name       = excluded.name,
 		  price      = excluded.price,
+		  price_date = excluded.price_date,
 		  extra      = excluded.extra,
 		  updated_at = CURRENT_TIMESTAMP
 	  `).bind(
 		r.assetType, r.source, r.code, r.name,
-		r.price, r.priceDate, JSON.stringify(r.extra ?? {})
+		r.price, priceDate, priceTs, JSON.stringify(r.extra ?? {})
 	  ).run();
   
 	  saved++;
@@ -265,37 +287,33 @@ export default {
   
   // ─── Sorgular ────────────────────────────────────────────────────────────────
   
-  async function getAssets(env, type, url) {
+  async function getAssets(env: Env, type: string, url: URL) {
 	const source = url.searchParams.get("source"); // opsiyonel filtre
 
-	// İstek geldiğinde önce kaynaktan çekip DB'yi güncelle (read-through cache).
-	// - source verilirse sadece o provider refresh edilir
-	// - source yoksa bu assetType'ı üreten tüm provider'lar refresh edilir
-	await refreshBeforeRead(env, type, source);
-
-	// Bir önceki price_date'e ait fiyatı LEFT JOIN ile çekerek değişim % hesaplanır.
+	// DB'deki en güncel (saatlik) kaydı döndürür.
+	// Not: Otomatik güncelleme cron ile yapılır; okuma path'i external kaynağa gitmez.
 	let query = `
 	  SELECT a.*, prev.price AS prev_price, prev.extra AS prev_extra
-	  FROM asset_prices a
+	  FROM asset_prices_hourly a
 	  INNER JOIN (
-		SELECT code, source, MAX(price_date) AS max_date
-		FROM asset_prices
+		SELECT code, source, MAX(price_ts) AS max_ts
+		FROM asset_prices_hourly
 		WHERE asset_type = ?
 		GROUP BY code, source
 	  ) latest ON a.code = latest.code
 			 AND a.source = latest.source
-			 AND a.price_date = latest.max_date
-	  LEFT JOIN asset_prices prev
+			 AND a.price_ts = latest.max_ts
+	  LEFT JOIN asset_prices_hourly prev
 		ON  prev.asset_type = a.asset_type
 		AND prev.code       = a.code
 		AND prev.source     = a.source
-		AND prev.price_date = (
-		  SELECT MAX(price_date)
-		  FROM   asset_prices
+		AND prev.price_ts = (
+		  SELECT MAX(price_ts)
+		  FROM   asset_prices_hourly
 		  WHERE  asset_type = a.asset_type
 		  AND    code       = a.code
 		  AND    source     = a.source
-		  AND    price_date < latest.max_date
+		  AND    price_ts   < latest.max_ts
 		)
 	  WHERE a.asset_type = ?
 	`;
@@ -313,7 +331,7 @@ export default {
 	  success: true,
 	  assetType: type,
 	  count: result.results.length,
-	  assets: result.results.map(row => {
+	  assets: result.results.map((row: any) => {
 		const { prev_price, prev_extra, ...rest } = row;
 		const asset = parseExtra(rest);
 
@@ -331,15 +349,12 @@ export default {
 	};
   }
   
-  async function getAsset(env, type, code) {
-	// Tek varlık isteklerinde de önce refresh et (tüm ilgili provider'lar).
-	await refreshBeforeRead(env, type, null);
-
+  async function getAsset(env: Env, type: string, code: string) {
 	const rows = await env.DB.prepare(`
 	  SELECT *
-	  FROM asset_prices
+	  FROM asset_prices_hourly
 	  WHERE asset_type = ? AND code = ?
-	  ORDER BY price_date DESC, updated_at DESC
+	  ORDER BY price_ts DESC, updated_at DESC
 	  LIMIT 10
 	`).bind(type, code).all();
   
@@ -348,9 +363,9 @@ export default {
 	}
   
 	// Her kaynak için en güncel kaydı döner
-	const bySource = {};
-	for (const row of rows.results) {
-	  if (!bySource[row.source]) bySource[row.source] = parseExtra(row);
+	const bySource: Record<string, any> = {};
+	for (const row of rows.results as any[]) {
+	  if (!bySource[(row as any).source]) bySource[(row as any).source] = parseExtra(row);
 	}
   
 	return {
@@ -361,22 +376,22 @@ export default {
 	};
   }
   
-  async function getHistory(env, type, code, url) {
-	const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "30"), 365);
+  async function getHistory(env: Env, type: string, code: string, url: URL) {
+	const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "300"), 5000);
 	const source = url.searchParams.get("source");
-  
-	// History çağrılarında da güncel veriyi önce çek.
-	await refreshBeforeRead(env, type, source);
+	const range = (url.searchParams.get("range") ?? "").toLowerCase(); // "1d" | "1w" | "30d" | "1y"
+	const sinceTs = range ? isoSince(range) : null;
 
 	let query = `
-	  SELECT * FROM asset_prices
+	  SELECT * FROM asset_prices_hourly
 	  WHERE asset_type = ? AND code = ?
 	`;
-	const params = [type, code];
+	const params: any[] = [type, code];
   
 	if (source) { query += " AND source = ?"; params.push(source); }
+	if (sinceTs) { query += " AND price_ts >= ?"; params.push(sinceTs); }
   
-	query += ` ORDER BY price_date DESC LIMIT ?`;
+	query += ` ORDER BY price_ts DESC LIMIT ?`;
 	params.push(limit);
   
 	const result = await env.DB.prepare(query).bind(...params).all();
@@ -390,7 +405,7 @@ export default {
 	};
   }
   
-  async function refreshBeforeRead(env, assetType, sourceId) {
+  async function refreshBeforeRead(env: Env, assetType: string, sourceId: string | null) {
 	// Bu fonksiyon, /assets isteklerinde DB'yi güncel tutmak için kullanılır.
 	// Hata durumunda okuma yine de yapılır (mevcut DB verisi döner).
 	try {
@@ -416,82 +431,88 @@ export default {
 
   // ─── Veritabanı ──────────────────────────────────────────────────────────────
   
-  async function ensureTables(env) {
+  async function ensureTables(env: Env) {
+	// Saatlik kayıt tutmak için yeni tablo (mevcut `asset_prices` gün bazlı kalabilir).
 	await env.DB.prepare(`
-	  CREATE TABLE IF NOT EXISTS asset_prices (
+	  CREATE TABLE IF NOT EXISTS asset_prices_hourly (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		asset_type TEXT NOT NULL,  -- currency | gold | silver | stock_tr | stock_us | crypto | fund
-		source     TEXT NOT NULL,  -- altinkaynak_currency | bist | coingecko | ...
-		code       TEXT NOT NULL,  -- USD | XAU_GRAM | THYAO | BTC | ...
+		asset_type TEXT NOT NULL,
+		source     TEXT NOT NULL,
+		code       TEXT NOT NULL,
 		name       TEXT,
-		price      REAL,           -- Standart fiyat (TRY cinsinden veya kaynağın birimi)
-		price_date TEXT NOT NULL,  -- YYYY-MM-DD
-		extra      TEXT,           -- JSON: kaynağa özgü ek alanlar
+		price      REAL,
+		price_date TEXT NOT NULL,  -- YYYY-MM-DD (kolay filtre için)
+		price_ts   TEXT NOT NULL,  -- ISO timestamp (saatlik granüler)
+		extra      TEXT,
 		updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-		UNIQUE(asset_type, source, code, price_date)
+		UNIQUE(asset_type, source, code, price_ts)
 	  )
 	`).run();
-  
-	// Sık sorgulanan sütunlara index
+
 	await env.DB.prepare(`
-	  CREATE INDEX IF NOT EXISTS idx_asset_type_code
-	  ON asset_prices(asset_type, code, price_date DESC)
+	  CREATE INDEX IF NOT EXISTS idx_prices_hourly_lookup
+	  ON asset_prices_hourly(asset_type, code, price_ts DESC)
+	`).run();
+
+	await env.DB.prepare(`
+	  CREATE INDEX IF NOT EXISTS idx_prices_hourly_latest
+	  ON asset_prices_hourly(asset_type, source, code, price_ts DESC)
 	`).run();
   }
   
   // ─── Yardımcı Fonksiyonlar ───────────────────────────────────────────────────
   
-  async function fetchUrl(url) {
+  async function fetchUrl(url: string) {
 	const res = await fetch(url, { headers: { "User-Agent": "InvestmentTracker/2.0" } });
 	if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
 	return res;
   }
   
-  function extractAttr(xml, tagName, attrName) {
+  function extractAttr(xml: string, tagName: string, attrName: string) {
 	const m = xml.match(new RegExp(`<${tagName}\\b([^>]*)>`, "i"));
 	if (!m) return null;
 	const a = m[1].match(new RegExp(`${attrName}="([^"]*)"`, "i"));
 	return a ? decodeXml(a[1]) : null;
   }
   
-  function extractAttrFromTag(block, attrName) {
+  function extractAttrFromTag(block: string, attrName: string) {
 	const m = block.match(/<Currency\b([^>]*)>/i);
 	if (!m) return null;
 	const a = m[1].match(new RegExp(`${attrName}="([^"]*)"`, "i"));
 	return a ? decodeXml(a[1]) : null;
   }
   
-  function tag(block, tagName) {
+  function tag(block: string, tagName: string) {
 	const m = block.match(new RegExp(`<${tagName}>([\\s\\S]*?)<\\/${tagName}>`, "i"));
 	return m ? decodeXml(m[1].trim()) : null;
   }
   
-  function toNum(v) {
+  function toNum(v: unknown) {
 	if (v === null || v === undefined || v === "") return null;
 	const n = Number(String(v).replace(",", "."));
 	return Number.isFinite(n) ? n : null;
   }
 
   // Türkçe sayı formatını parse eder: "6.756,47" → 6756.47
-  function parseTurkishNum(v) {
+  function parseTurkishNum(v: unknown) {
 	if (v === null || v === undefined || v === "") return null;
 	const n = Number(String(v).replace(/\./g, "").replace(",", "."));
 	return Number.isFinite(n) ? n : null;
   }
   
-  function midpoint(a, b) {
+  function midpoint(a: unknown, b: unknown) {
 	const na = toNum(a), nb = toNum(b);
 	if (na !== null && nb !== null) return (na + nb) / 2;
 	return na ?? nb ?? null;
   }
   
-  function decodeXml(v) {
+  function decodeXml(v: unknown) {
 	return String(v)
 	  .replaceAll("&amp;", "&").replaceAll("&lt;", "<")
 	  .replaceAll("&gt;", ">").replaceAll("&quot;", '"').replaceAll("&apos;", "'");
   }
   
-  function parseExtra(row) {
+  function parseExtra(row: any) {
 	try { row.extra = JSON.parse(row.extra ?? "{}"); } catch { row.extra = {}; }
 	return row;
   }
@@ -508,12 +529,28 @@ export default {
   function todayISO() {
 	return new Date().toISOString().slice(0, 10);
   }
+
+  function nowIsoHour() {
+	const d = new Date();
+	d.setMinutes(0, 0, 0);
+	return d.toISOString(); // örn: 2026-04-26T12:00:00.000Z
+  }
+
+  function isoSince(range: string) {
+	const d = new Date();
+	if (range === "1d") d.setDate(d.getDate() - 1);
+	else if (range === "1w" || range === "7d") d.setDate(d.getDate() - 7);
+	else if (range === "30d") d.setDate(d.getDate() - 30);
+	else if (range === "1y" || range === "365d") d.setFullYear(d.getFullYear() - 1);
+	else return null;
+	return d.toISOString();
+  }
   
-  function json(data, status = 200) {
+  function json(data: unknown, status = 200) {
 	return Response.json(data, { status });
   }
   
-  function jsonError(message, status = 400) {
+  function jsonError(message: string, status = 400) {
 	return Response.json({ success: false, error: message }, { status });
   }
   
@@ -526,6 +563,6 @@ export default {
 	"GET /assets/gold                      → Altın fiyatları: kod, ad, alış, satış, değişim % (kaynak: altinkaynak_gold)",
 	"GET /assets/{type}?source={source}    → Kaynağa göre filtrele",
 	"GET /assets/{type}/{code}             → Tek varlık (tüm kaynaklar)",
-	"GET /assets/{type}/{code}/history     → Geçmiş fiyatlar (?limit=30)",
+	"GET /assets/{type}/{code}/history     → Geçmiş fiyatlar (?limit=300&range=1d|1w|30d|1y)",
 	"GET /sources                          → Kayıtlı veri kaynakları"
   ];

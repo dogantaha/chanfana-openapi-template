@@ -4,9 +4,8 @@
 	"name": "chanfana-openapi-template",
 	"upload_source_maps": true,
 	"triggers": {
-		// Türkiye saati (UTC+3): 06:00 ve 19:00
-		// UTC karşılıkları: 03:00 ve 16:00
-		"crons": ["0 3 * * *", "0 16 * * *"]
+		// Saatlik otomatik senkron (UTC). Örn: 12:00, 13:00, 14:00...
+		"crons": ["0 * * * *"]
 	},
 	"observability": {
 		"enabled": true
