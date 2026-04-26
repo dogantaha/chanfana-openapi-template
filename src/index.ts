@@ -131,35 +131,40 @@ export default {
 	  }
 	},
   
-	// ── TCMB: Gram Altın ─────────────────────────────────────────────────────
+	// ── Altınkaynak: Altın Fiyatları ─────────────────────────────────────────
 	//
-	// TCMB gram altın fiyatını ayrı bir endpoint'te yayınlar.
-	// İleride IAB/Kapalıçarşı verileri buraya paralel eklenebilir.
-	tcmb_gold: {
+	// Herkese açık statik JSON servisi: https://static.altinkaynak.com/public/Gold
+	// Alanlar: Kod, Aciklama, Alis, Satis, GuncellenmeZamani
+	altinkaynak_gold: {
 	  meta: () => ({
-		id: "tcmb_gold",
-		name: "TCMB Gram Altın",
+		id: "altinkaynak_gold",
+		name: "Altınkaynak Altın Fiyatları",
 		assetTypes: ["gold"],
-		url: "https://www.tcmb.gov.tr/kurlar/today.xml"
+		url: "https://static.altinkaynak.com/public/Gold"
 	  }),
-  
+
 	  fetch: async (env) => {
-		// TCMB XML'inde XAU (troy ons altın) varsa onu kullan,
-		// yoksa USD/TRY × uluslararası spot olarak hesapla.
-		// Şimdilik placeholder — gerçek endpoint entegrasyon sırasında doldurulur.
-		//
-		// TODO: TCMB'nin altın sayfası: https://www.tcmb.gov.tr/wps/wcm/connect/TR/TCMB+TR/Main+Menu/Istatistikler/Doviz+Kurlari/Altin+Fiyatlari
-		return [
-		  {
+		const res = await fetchUrl("https://static.altinkaynak.com/public/Gold");
+		const items = await res.json();
+		const priceDate = todayISO();
+
+		return items.map(item => {
+		  const buy  = parseTurkishNum(item.Alis);
+		  const sell = parseTurkishNum(item.Satis);
+		  return {
 			assetType: "gold",
-			source: "tcmb_gold",
-			code: "XAU_GRAM",      // ISO-benzeri: troy-ons için XAU, gram için XAU_GRAM
-			name: "Gram Altın (TCMB)",
-			priceDate: todayISO(),
-			price: null,           // TODO
-			extra: { unit: "gram" }
-		  }
-		];
+			source:    "altinkaynak_gold",
+			code:      item.Kod,
+			name:      item.Aciklama,
+			priceDate,
+			price: midpoint(buy, sell),
+			extra: {
+			  buy,
+			  sell,
+			  updated_at: item.GuncellenmeZamani
+			}
+		  };
+		}).filter(r => r.price !== null);
 	  }
 	},
   
@@ -267,9 +272,10 @@ export default {
   
   async function getAssets(env, type, url) {
 	const source = url.searchParams.get("source"); // opsiyonel filtre
-  
+
+	// Bir önceki price_date'e ait fiyatı LEFT JOIN ile çekerek değişim % hesaplanır.
 	let query = `
-	  SELECT a.*
+	  SELECT a.*, prev.price AS prev_price
 	  FROM asset_prices a
 	  INNER JOIN (
 		SELECT code, source, MAX(price_date) AS max_date
@@ -279,23 +285,42 @@ export default {
 	  ) latest ON a.code = latest.code
 			 AND a.source = latest.source
 			 AND a.price_date = latest.max_date
+	  LEFT JOIN asset_prices prev
+		ON  prev.asset_type = a.asset_type
+		AND prev.code       = a.code
+		AND prev.source     = a.source
+		AND prev.price_date = (
+		  SELECT MAX(price_date)
+		  FROM   asset_prices
+		  WHERE  asset_type = a.asset_type
+		  AND    code       = a.code
+		  AND    source     = a.source
+		  AND    price_date < latest.max_date
+		)
 	  WHERE a.asset_type = ?
 	`;
 	const params = [type, type];
-  
+
 	if (source) {
 	  query += " AND a.source = ?";
 	  params.push(source);
 	}
-  
+
 	query += " ORDER BY a.code ASC";
-  
+
 	const result = await env.DB.prepare(query).bind(...params).all();
 	return {
 	  success: true,
 	  assetType: type,
 	  count: result.results.length,
-	  assets: result.results.map(parseExtra)
+	  assets: result.results.map(row => {
+		const { prev_price, ...rest } = row;
+		const asset = parseExtra(rest);
+		const changePct = (prev_price && asset.price)
+		  ? Math.round((asset.price - prev_price) / prev_price * 10000) / 100
+		  : null;
+		return { ...asset, change_pct: changePct };
+	  })
 	};
   }
   
@@ -409,6 +434,13 @@ export default {
 	const n = Number(String(v).replace(",", "."));
 	return Number.isFinite(n) ? n : null;
   }
+
+  // Türkçe sayı formatını parse eder: "6.756,47" → 6756.47
+  function parseTurkishNum(v) {
+	if (v === null || v === undefined || v === "") return null;
+	const n = Number(String(v).replace(/\./g, "").replace(",", "."));
+	return Number.isFinite(n) ? n : null;
+  }
   
   function midpoint(a, b) {
 	const na = toNum(a), nb = toNum(b);
@@ -443,8 +475,9 @@ export default {
   
   const ENDPOINT_DOCS = [
 	"GET /sync/all                          → Tüm kaynakları güncelle",
-	"GET /sync/{source|type}               → Tek kaynak/tip güncelle (örn: tcmb_currency, gold)",
-	"GET /assets/{type}                    → En güncel fiyatlar (currency|gold|silver|stock_tr|stock_us|crypto|fund)",
+	"GET /sync/{source|type}               → Tek kaynak/tip güncelle (örn: tcmb_currency, gold, altinkaynak_gold)",
+	"GET /assets/{type}                    → En güncel fiyatlar + değişim % (currency|gold|silver|stock_tr|stock_us|crypto|fund)",
+	"GET /assets/gold                      → Altın fiyatları: kod, ad, alış, satış, değişim % (kaynak: altinkaynak_gold)",
 	"GET /assets/{type}?source={source}    → Kaynağa göre filtrele",
 	"GET /assets/{type}/{code}             → Tek varlık (tüm kaynaklar)",
 	"GET /assets/{type}/{code}/history     → Geçmiş fiyatlar (?limit=30)",
