@@ -47,8 +47,14 @@ export default {
 	},
   
 	// Cron tetikleyici — wrangler.jsonc içinde `triggers.crons` ile tanımlı
+	// "*/5 * * * *" → sadece BIST 100
+	// "0 * * * *"   → döviz + altın (BIST hariç)
 	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-	  ctx.waitUntil(syncAll(env));
+	  if (event.cron === "*/5 * * * *") {
+		ctx.waitUntil(syncBist(env));
+	  } else {
+		ctx.waitUntil(syncAll(env));
+	  }
 	}
   };
   
@@ -85,8 +91,6 @@ export default {
 	  if (!type) return jsonError("Asset type required. See / for available types.", 400);
 
 	  await ensureTables(env);
-	  const sourceFilter = url.searchParams.get("source");
-	  await refreshIfStale(env, type, sourceFilter);
 
 	  if (!code) return json(await getAssets(env, type, url));
 	  if (!sub)  return json(await getAsset(env, type, code.toUpperCase()));
@@ -205,67 +209,53 @@ export default {
 
 	  fetch: async (_env: Env) => {
 		const COLUMNS = ["name", "close", "change", "change_abs", "high", "low", "volume", "market_cap_basic", "description"];
-		const PAGE = 500;
-		const records: ProviderRecord[] = [];
-		let offset = 0;
+		const body = {
+		  filter: [],
+		  options: { lang: "tr" },
+		  symbols: { query: { types: [] }, tickers: [] },
+		  columns: COLUMNS,
+		  sort: { sortBy: "market_cap_basic", sortOrder: "desc" },
+		  range: [0, 100]
+		};
 
-		while (true) {
-		  const body = {
-			filter: [],
-			options: { lang: "tr" },
-			symbols: { query: { types: [] }, tickers: [] },
-			columns: COLUMNS,
-			sort: { sortBy: "market_cap_basic", sortOrder: "desc" },
-			range: [offset, offset + PAGE]
+		const res = await fetch("https://scanner.tradingview.com/turkey/scan", {
+		  method: "POST",
+		  headers: {
+			"Content-Type": "application/json",
+			"User-Agent": "Mozilla/5.0",
+			"Origin": "https://www.tradingview.com",
+			"Referer": "https://www.tradingview.com/"
+		  },
+		  body: JSON.stringify(body)
+		});
+
+		if (!res.ok) throw new Error(`TradingView scanner HTTP ${res.status}`);
+
+		const data = await res.json() as any;
+		const rows: any[] = data.data ?? [];
+
+		return rows.map((row: any) => {
+		  const [tvName, close, change, changeAbs, high, low, volume, marketCap, description] = row.d as any[];
+		  const rawCode = String(tvName ?? "");
+		  const code = rawCode.includes(":") ? rawCode.split(":")[1] : rawCode;
+
+		  return {
+			assetType: "stock_tr",
+			source: "bist",
+			code,
+			name: description ?? code,
+			price: toNum(close),
+			priceDate: todayISO(),
+			extra: {
+			  change_pct: toNum(change),
+			  change_abs: toNum(changeAbs),
+			  high: toNum(high),
+			  low: toNum(low),
+			  volume: toNum(volume),
+			  market_cap: toNum(marketCap)
+			}
 		  };
-
-		  const res = await fetch("https://scanner.tradingview.com/turkey/scan", {
-			method: "POST",
-			headers: {
-			  "Content-Type": "application/json",
-			  "User-Agent": "Mozilla/5.0",
-			  "Origin": "https://www.tradingview.com",
-			  "Referer": "https://www.tradingview.com/"
-			},
-			body: JSON.stringify(body)
-		  });
-
-		  if (!res.ok) throw new Error(`TradingView scanner HTTP ${res.status}`);
-
-		  const data = await res.json() as any;
-		  const rows: any[] = data.data ?? [];
-		  if (!rows.length) break;
-
-		  for (const row of rows) {
-			const [tvName, close, change, changeAbs, high, low, volume, marketCap, description] = row.d as any[];
-			// TradingView sembolü "BIST:THYAO" formatında gelir
-			const rawCode = String(tvName ?? "");
-			const code = rawCode.includes(":") ? rawCode.split(":")[1] : rawCode;
-
-			records.push({
-			  assetType: "stock_tr",
-			  source: "bist",
-			  code,
-			  name: description ?? code,
-			  price: toNum(close),
-			  priceDate: todayISO(),
-			  extra: {
-				change_pct: toNum(change),
-				change_abs: toNum(changeAbs),
-				high: toNum(high),
-				low: toNum(low),
-				volume: toNum(volume),
-				market_cap: toNum(marketCap)
-			  }
-			});
-		  }
-
-		  // Son sayfa geldiyse çık
-		  if (rows.length < PAGE) break;
-		  offset += PAGE;
-		}
-
-		return records.filter(r => r.price !== null);
+		}).filter((r: any) => r.price !== null);
 	  }
 	},
   
@@ -293,8 +283,9 @@ export default {
   async function syncAll(env: Env) {
 	await ensureTables(env);
 	const results: Record<string, any> = {};
-  
+
 	for (const [id, provider] of Object.entries(PROVIDERS)) {
+	  if (id === "bist") continue; // BIST kendi cron'unda güncellenir
 	  try {
 		results[id] = await runProvider(env, provider);
 	  } catch (err) {
@@ -302,8 +293,19 @@ export default {
 		results[id] = { success: false, error: msg };
 	  }
 	}
-  
+
 	return { success: true, results };
+  }
+
+  async function syncBist(env: Env) {
+	await ensureTables(env);
+	try {
+	  const result = await runProvider(env, PROVIDERS.bist);
+	  return { success: true, results: { bist: result } };
+	} catch (err) {
+	  const msg = err instanceof Error ? err.message : String(err);
+	  return { success: false, results: { bist: { success: false, error: msg } } };
+	}
   }
   
   async function syncOne(env: Env, type: string) {
@@ -479,41 +481,6 @@ export default {
 	};
   }
   
-  // TTL_SECONDS: son sync bu süreden eskiyse (veya hiç yoksa) kaynak tekrar sorgulanır.
-  // İstek geldiğinde taze veri varsa DB'den döner, eskiyse provider çağrılır.
-  const REFRESH_TTL_SECONDS = 120;
-
-  async function refreshIfStale(env: Env, assetType: string, sourceId: string | null) {
-	try {
-	  await ensureTables(env);
-
-	  const providers = sourceId
-		? [PROVIDERS[sourceId]].filter(p => p?.meta().assetTypes.includes(assetType))
-		: Object.values(PROVIDERS).filter(p => p.meta().assetTypes.includes(assetType));
-
-	  for (const provider of providers) {
-		const sid = provider.meta().id;
-
-		// DB'deki en son price_ts'i sorgula
-		const row = await env.DB.prepare(`
-		  SELECT MAX(price_ts) AS last_ts
-		  FROM asset_prices_hourly
-		  WHERE asset_type = ? AND source = ?
-		`).bind(assetType, sid).first() as any;
-
-		const lastTs: string | null = row?.last_ts ?? null;
-		const ageSeconds = lastTs
-		  ? (Date.now() - new Date(lastTs).getTime()) / 1000
-		  : Infinity;
-
-		if (ageSeconds > REFRESH_TTL_SECONDS) {
-		  await runProvider(env, provider);
-		}
-	  }
-	} catch (err) {
-	  console.warn("Refresh failed, returning cached data:", err);
-	}
-  }
 
   // ─── Veritabanı ──────────────────────────────────────────────────────────────
   

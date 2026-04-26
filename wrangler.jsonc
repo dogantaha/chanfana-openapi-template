@@ -4,8 +4,9 @@
 	"name": "chanfana-openapi-template",
 	"upload_source_maps": true,
 	"triggers": {
-		// Saatlik otomatik senkron (UTC). Örn: 12:00, 13:00, 14:00...
-		"crons": ["0 * * * *"]
+		// "*/5 * * * *" → her 5 dakikada bir BIST 100 senkron
+		// "0 * * * *"   → saatte bir döviz + altın senkron
+		"crons": ["*/5 * * * *", "0 * * * *"]
 	},
 	"observability": {
 		"enabled": true
