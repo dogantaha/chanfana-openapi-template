@@ -4,9 +4,9 @@
 	"name": "chanfana-openapi-template",
 	"upload_source_maps": true,
 	"triggers": {
-		// "*/5 * * * *" → her 5 dakikada bir BIST 100 senkron
-		// "0 * * * *"   → saatte bir döviz + altın senkron
-		"crons": ["*/5 * * * *", "0 * * * *"]
+		// "*/2 * * * *" → her 2 dakikada bir döviz + altın (altınkaynak)
+		// "*/5 * * * *" → her 5 dakikada bir BIST 100
+		"crons": ["*/2 * * * *", "*/5 * * * *"]
 	},
 	"observability": {
 		"enabled": true

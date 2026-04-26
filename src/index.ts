@@ -47,10 +47,12 @@ export default {
 	},
   
 	// Cron tetikleyici — wrangler.jsonc içinde `triggers.crons` ile tanımlı
-	// "*/5 * * * *" → sadece BIST 100
-	// "0 * * * *"   → döviz + altın (BIST hariç)
+	// "*/2 * * * *" → döviz + altın (altınkaynak)
+	// "*/5 * * * *" → BIST 100
 	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-	  if (event.cron === "*/5 * * * *") {
+	  if (event.cron === "*/2 * * * *") {
+		ctx.waitUntil(syncAltinkaynak(env));
+	  } else if (event.cron === "*/5 * * * *") {
 		ctx.waitUntil(syncBist(env));
 	  } else {
 		ctx.waitUntil(syncAll(env));
@@ -294,6 +296,20 @@ export default {
 	  }
 	}
 
+	return { success: true, results };
+  }
+
+  async function syncAltinkaynak(env: Env) {
+	await ensureTables(env);
+	const results: Record<string, any> = {};
+	for (const id of ["altinkaynak_currency", "altinkaynak_gold"]) {
+	  try {
+		results[id] = await runProvider(env, PROVIDERS[id]);
+	  } catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		results[id] = { success: false, error: msg };
+	  }
+	}
 	return { success: true, results };
   }
 
