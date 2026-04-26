@@ -1,72 +1,85 @@
-# OpenAPI Template
+# Piyasa Worker Backend
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/templates/tree/main/chanfana-openapi-template)
+Cloudflare Worker üzerinde çalışan basit bir “piyasa verisi” API’si. Döviz ve altın (şu an aktif iki varlık tipi) verisini dış kaynaktan çekip normalize eder, **D1** veritabanına yazar ve API üzerinden en güncel kaydı döner.
 
-![OpenAPI Template Preview](https://imagedelivery.net/wSMYJvS3Xw-n339CbDyDIA/91076b39-1f5b-46f6-7f14-536a6f183000/public)
+## API akışı (istek gelince ne oluyor?)
 
-<!-- dash-content-start -->
+Uygulama girişi `src/index.ts` içindeki `fetch` fonksiyonudur.
 
-This is a Cloudflare Worker with OpenAPI 3.1 Auto Generation and Validation using [chanfana](https://github.com/cloudflare/chanfana) and [Hono](https://github.com/honojs/hono).
+### 1) Route çözümü
 
-This is an example project made to be used as a quick start into building OpenAPI compliant Workers that generates the
-`openapi.json` schema automatically from code and validates the incoming request to the defined parameters or request body.
+- `GET /assets/{type}` istekleri varlık liste endpoint’idir.
+- `type` örnekleri: `currency`, `gold`
 
-This template includes various endpoints, a D1 database, and integration tests using [Vitest](https://vitest.dev/) as examples. In endpoints, you will find [chanfana D1 AutoEndpoints](https://chanfana.com/endpoints/auto/d1) and a [normal endpoint](https://chanfana.com/endpoints/defining-endpoints) to serve as examples for your projects.
+### 2) Okumadan önce “refresh” (read-through cache)
 
-Besides being able to see the OpenAPI schema (openapi.json) in the browser, you can also extract the schema locally no hassle by running this command `npm run schema`.
+`/assets/...` isteklerinde önce `refreshBeforeRead(...)` çalışır:
 
-<!-- dash-content-end -->
+- **`source` query parametresi varsa** sadece o provider güncellenir  
+  Örn: `GET /assets/currency?source=altinkaynak_currency`
+- **`source` yoksa** bu `assetType`’ı üreten tüm provider’lar güncellenir  
+  Örn: `GET /assets/currency` → `currency` üreten provider(lar) çalışır
 
-> [!IMPORTANT]
-> When using C3 to create this project, select "no" when it asks if you want to deploy. You need to follow this project's [setup steps](https://github.com/cloudflare/templates/tree/main/openapi-template#setup-steps) before deploying.
+Refresh başarısız olursa istek yine cevaplanır (varsa D1’deki mevcut veriler döner).
 
-## Getting Started
+### 3) Provider dış kaynaktan çeker ve normalize eder
 
-Outside of this repo, you can start a new project with this template using [C3](https://developers.cloudflare.com/pages/get-started/c3/) (the `create-cloudflare` CLI):
+Provider’lar `PROVIDERS` objesinde tanımlıdır ve her biri:
+
+- `meta()` → provider bilgisi (id, isim, url, ürettiği assetTypes)
+- `fetch(env)` → normalize edilmiş kayıt listesi döner
+
+Aktif kaynaklar:
+
+- **Döviz (currency)**: `altinkaynak_currency`  
+  Kaynak: `https://static.altinkaynak.com/public/Currency`
+- **Altın (gold)**: `altinkaynak_gold`  
+  Kaynak: `https://static.altinkaynak.com/public/Gold`
+
+Normalize edilen standart alanlar:
+
+- `assetType`: `currency` / `gold`
+- `source`: provider id (örn. `altinkaynak_currency`)
+- `code`: (örn. `USD`)
+- `name`: açıklama
+- `priceDate`: `YYYY-MM-DD`
+- `price`: **alış/satış orta değeri** (midpoint)
+- `extra`: ham alanlar (`buy`, `sell`, `updated_at` vb.)
+
+### 4) D1’e yazma (upsert)
+
+Provider çıktısı `runProvider(...)` ile `asset_prices` tablosuna yazılır:
+
+- Unique: `(asset_type, source, code, price_date)`
+- Aynı gün/varlık gelirse **update** edilir.
+
+### 5) API cevabı D1’den okunur
+
+`getAssets(...)` sonrasında:
+
+- Her `code+source` için en güncel `price_date` seçilir
+- Bir önceki kaydı da join’leyip değişim % hesaplanır
+- JSON olarak döndürülür
+
+## Endpoint’ler
+
+- `GET /assets/currency` → tüm döviz kurları (en güncel)
+- `GET /assets/gold` → tüm altın fiyatları (en güncel)
+- `GET /assets/{type}?source={sourceId}` → kaynağa göre filtre
+- `GET /assets/{type}/{code}` → tek varlık (örn. `USD`)
+- `GET /assets/{type}/{code}/history?limit=30` → geçmiş kayıtlar
+- `GET /sync/all` → tüm provider’ları çalıştırır (D1’i günceller)
+- `GET /sync/{source|type}` → tek provider veya tek varlık tipi güncelleme  
+  Örn: `GET /sync/altinkaynak_currency` veya `GET /sync/currency`
+- `GET /sources` → provider listesini döner
+
+## Hızlı deneme (örnek istekler)
 
 ```bash
-npm create cloudflare@latest -- --template=cloudflare/templates/openapi-template
+curl -s "http://localhost:8787/assets/currency" | jq .
+curl -s "http://localhost:8787/assets/gold" | jq .
+curl -s "http://localhost:8787/assets/currency?source=altinkaynak_currency" | jq .
+curl -s "http://localhost:8787/sync/altinkaynak_currency" | jq .
 ```
 
-A live public deployment of this template is available at [https://openapi-template.templates.workers.dev](https://openapi-template.templates.workers.dev)
-
-## Setup Steps
-
-1. Install the project dependencies with a package manager of your choice:
-   ```bash
-   npm install
-   ```
-2. Create a [D1 database](https://developers.cloudflare.com/d1/get-started/) with the name "openapi-template-db":
-   ```bash
-   npx wrangler d1 create openapi-template-db
-   ```
-   ...and update the `database_id` field in `wrangler.json` with the new database ID.
-3. Run the following db migration to initialize the database (notice the `migrations` directory in this project):
-   ```bash
-   npx wrangler d1 migrations apply DB --remote
-   ```
-4. Deploy the project!
-   ```bash
-   npx wrangler deploy
-   ```
-5. Monitor your worker
-   ```bash
-   npx wrangler tail
-   ```
-
-## Testing
-
-This template includes integration tests using [Vitest](https://vitest.dev/). To run the tests locally:
-
-```bash
-npm run test
-```
-
-Test files are located in the `tests/` directory, with examples demonstrating how to test your endpoints and database interactions.
-
-## Project structure
-
-1. Your main router is defined in `src/index.ts`.
-2. Each endpoint has its own file in `src/endpoints/`.
-3. Integration tests are located in the `tests/` directory.
-4. For more information read the [chanfana documentation](https://chanfana.com/), [Hono documentation](https://hono.dev/docs), and [Vitest documentation](https://vitest.dev/guide/).
+> Lokal port `wrangler dev` konfigürasyonuna göre değişebilir.

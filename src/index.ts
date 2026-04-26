@@ -85,49 +85,44 @@ export default {
   // Yeni bir kaynak eklemek için sadece buraya yeni bir obje ekleyin.
   
   const PROVIDERS = {
-  
-	// ── TCMB: Döviz ──────────────────────────────────────────────────────────
-	tcmb_currency: {
+
+	// ── Altınkaynak: Döviz Kurları ───────────────────────────────────────────
+	//
+	// Herkese açık statik JSON servisi: https://static.altinkaynak.com/public/Currency
+	// Alanlar: Kod, Aciklama, Alis, Satis, GuncellenmeZamani
+	altinkaynak_currency: {
 	  meta: () => ({
-		id: "tcmb_currency",
-		name: "TCMB Döviz Kurları",
+		id: "altinkaynak_currency",
+		name: "Altınkaynak Döviz Kurları",
 		assetTypes: ["currency"],
-		url: "https://www.tcmb.gov.tr/kurlar/today.xml"
+		url: "https://static.altinkaynak.com/public/Currency"
 	  }),
-  
+
 	  fetch: async (env) => {
-		const res = await fetchUrl("https://www.tcmb.gov.tr/kurlar/today.xml");
-		const xml = await res.text();
-  
-		const priceDate = extractAttr(xml, "Tarih_Date", "Tarih")
-		  || extractAttr(xml, "Tarih_Date", "Date")
-		  || todayISO();
-  
-		const blocks = [...xml.matchAll(/<Currency\b[^>]*>[\s\S]*?<\/Currency>/g)]
-		  .map(m => m[0]);
-  
-		return blocks.map(block => {
-		  const code = extractAttrFromTag(block, "Kod");
-		  if (!code) return null;
-  
+		const res = await fetchUrl("https://static.altinkaynak.com/public/Currency");
+		const items = (await res.json()) as any[];
+
+		return items.map((item: any) => {
+		  const buy  = parseTurkishNum(item.Alis);
+		  const sell = parseTurkishNum(item.Satis);
+		  const priceDate = item.GuncellenmeZamani
+			? normalizeAltinkaynakDateTime(item.GuncellenmeZamani)
+			: todayISO();
+
 		  return {
 			assetType: "currency",
-			source: "tcmb_currency",
-			code,
-			name: tag(block, "Isim"),
+			source:    "altinkaynak_currency",
+			code:      String(item.Kod ?? "").toUpperCase(),
+			name:      item.Aciklama,
 			priceDate,
-			// Para birimi için standart alan: orta kur (alış+satış / 2)
-			// Tüm ham veriler extra'da saklanır
-			price: midpoint(tag(block, "ForexBuying"), tag(block, "ForexSelling")),
+			price: midpoint(buy, sell),
 			extra: {
-			  unit:             toNum(tag(block, "Unit")),
-			  forex_buying:     toNum(tag(block, "ForexBuying")),
-			  forex_selling:    toNum(tag(block, "ForexSelling")),
-			  banknote_buying:  toNum(tag(block, "BanknoteBuying")),
-			  banknote_selling: toNum(tag(block, "BanknoteSelling"))
+			  buy,
+			  sell,
+			  updated_at: item.GuncellenmeZamani
 			}
 		  };
-		}).filter(Boolean);
+		}).filter(r => r.code && r.price !== null);
 	  }
 	},
   
@@ -145,10 +140,10 @@ export default {
 
 	  fetch: async (env) => {
 		const res = await fetchUrl("https://static.altinkaynak.com/public/Gold");
-		const items = await res.json();
+		const items = (await res.json()) as any[];
 		const priceDate = todayISO();
 
-		return items.map(item => {
+		return items.map((item: any) => {
 		  const buy  = parseTurkishNum(item.Alis);
 		  const sell = parseTurkishNum(item.Satis);
 		  return {
@@ -221,7 +216,7 @@ export default {
   async function syncOne(env, type) {
 	await ensureTables(env);
   
-	// type → "tcmb_currency" gibi bir source ID olabilir,
+	// type → "altinkaynak_currency" gibi bir source ID olabilir,
 	//        ya da "currency" gibi bir asset type olabilir
 	const byId   = PROVIDERS[type];
 	const byType = Object.values(PROVIDERS).filter(p => p.meta().assetTypes.includes(type));
@@ -426,7 +421,7 @@ export default {
 	  CREATE TABLE IF NOT EXISTS asset_prices (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
 		asset_type TEXT NOT NULL,  -- currency | gold | silver | stock_tr | stock_us | crypto | fund
-		source     TEXT NOT NULL,  -- tcmb_currency | bist | coingecko | ...
+		source     TEXT NOT NULL,  -- altinkaynak_currency | bist | coingecko | ...
 		code       TEXT NOT NULL,  -- USD | XAU_GRAM | THYAO | BTC | ...
 		name       TEXT,
 		price      REAL,           -- Standart fiyat (TRY cinsinden veya kaynağın birimi)
@@ -501,6 +496,15 @@ export default {
 	return row;
   }
   
+  // Altınkaynak zaman formatı: "25.04.2026 23:31:33" → "2026-04-25"
+  function normalizeAltinkaynakDateTime(v: unknown) {
+	if (!v) return todayISO();
+	const m = String(v).match(/^\s*(\d{2})\.(\d{2})\.(\d{4})(?:\s+|T|$)/);
+	if (!m) return todayISO();
+	const [, dd, mm, yyyy] = m;
+	return `${yyyy}-${mm}-${dd}`;
+  }
+
   function todayISO() {
 	return new Date().toISOString().slice(0, 10);
   }
@@ -517,7 +521,7 @@ export default {
   
   const ENDPOINT_DOCS = [
 	"GET /sync/all                          → Tüm kaynakları güncelle",
-	"GET /sync/{source|type}               → Tek kaynak/tip güncelle (örn: tcmb_currency, gold, altinkaynak_gold)",
+	"GET /sync/{source|type}               → Tek kaynak/tip güncelle (örn: altinkaynak_currency, gold, altinkaynak_gold)",
 	"GET /assets/{type}                    → En güncel fiyatlar + değişim % (currency|gold|silver|stock_tr|stock_us|crypto|fund)",
 	"GET /assets/gold                      → Altın fiyatları: kod, ad, alış, satış, değişim % (kaynak: altinkaynak_gold)",
 	"GET /assets/{type}?source={source}    → Kaynağa göre filtrele",
