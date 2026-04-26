@@ -273,9 +273,14 @@ export default {
   async function getAssets(env, type, url) {
 	const source = url.searchParams.get("source"); // opsiyonel filtre
 
+	// İstek geldiğinde önce kaynaktan çekip DB'yi güncelle (read-through cache).
+	// - source verilirse sadece o provider refresh edilir
+	// - source yoksa bu assetType'ı üreten tüm provider'lar refresh edilir
+	await refreshBeforeRead(env, type, source);
+
 	// Bir önceki price_date'e ait fiyatı LEFT JOIN ile çekerek değişim % hesaplanır.
 	let query = `
-	  SELECT a.*, prev.price AS prev_price
+	  SELECT a.*, prev.price AS prev_price, prev.extra AS prev_extra
 	  FROM asset_prices a
 	  INNER JOIN (
 		SELECT code, source, MAX(price_date) AS max_date
@@ -314,10 +319,17 @@ export default {
 	  assetType: type,
 	  count: result.results.length,
 	  assets: result.results.map(row => {
-		const { prev_price, ...rest } = row;
+		const { prev_price, prev_extra, ...rest } = row;
 		const asset = parseExtra(rest);
-		const changePct = (prev_price && asset.price)
-		  ? Math.round((asset.price - prev_price) / prev_price * 10000) / 100
+
+		// Değişim %: altın için alış fiyatına göre hesaplanır (extra.buy).
+		// Diğer varlıklarda da buy yoksa null döner.
+		let prevBuy = null;
+		try { prevBuy = JSON.parse(prev_extra ?? "{}")?.buy ?? null; } catch { prevBuy = null; }
+		const currBuy = asset?.extra?.buy ?? null;
+
+		const changePct = (prevBuy && currBuy)
+		  ? Math.round((currBuy - prevBuy) / prevBuy * 10000) / 100
 		  : null;
 		return { ...asset, change_pct: changePct };
 	  })
@@ -325,6 +337,9 @@ export default {
   }
   
   async function getAsset(env, type, code) {
+	// Tek varlık isteklerinde de önce refresh et (tüm ilgili provider'lar).
+	await refreshBeforeRead(env, type, null);
+
 	const rows = await env.DB.prepare(`
 	  SELECT *
 	  FROM asset_prices
@@ -355,6 +370,9 @@ export default {
 	const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "30"), 365);
 	const source = url.searchParams.get("source");
   
+	// History çağrılarında da güncel veriyi önce çek.
+	await refreshBeforeRead(env, type, source);
+
 	let query = `
 	  SELECT * FROM asset_prices
 	  WHERE asset_type = ? AND code = ?
@@ -377,6 +395,30 @@ export default {
 	};
   }
   
+  async function refreshBeforeRead(env, assetType, sourceId) {
+	// Bu fonksiyon, /assets isteklerinde DB'yi güncel tutmak için kullanılır.
+	// Hata durumunda okuma yine de yapılır (mevcut DB verisi döner).
+	try {
+	  await ensureTables(env);
+
+	  if (sourceId) {
+		const provider = PROVIDERS[sourceId];
+		if (provider && provider.meta().assetTypes.includes(assetType)) {
+		  await runProvider(env, provider);
+		}
+		return;
+	  }
+
+	  const providers = Object.values(PROVIDERS)
+		.filter(p => p.meta().assetTypes.includes(assetType));
+	  for (const p of providers) {
+		await runProvider(env, p);
+	  }
+	} catch (err) {
+	  console.warn("Refresh before read failed:", err);
+	}
+  }
+
   // ─── Veritabanı ──────────────────────────────────────────────────────────────
   
   async function ensureTables(env) {

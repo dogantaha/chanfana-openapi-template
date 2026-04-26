@@ -3,6 +3,11 @@
 	"main": "src/index.ts",
 	"name": "chanfana-openapi-template",
 	"upload_source_maps": true,
+	"triggers": {
+		// Türkiye saati (UTC+3): 06:00 ve 19:00
+		// UTC karşılıkları: 03:00 ve 16:00
+		"crons": ["0 3 * * *", "0 16 * * *"]
+	},
 	"observability": {
 		"enabled": true
 	},
