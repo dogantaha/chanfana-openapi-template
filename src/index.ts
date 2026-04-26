@@ -83,9 +83,11 @@ export default {
 	  const [, type, code, sub] = segments;
   
 	  if (!type) return jsonError("Asset type required. See / for available types.", 400);
-  
+
 	  await ensureTables(env);
-  
+	  const sourceFilter = url.searchParams.get("source");
+	  await refreshIfStale(env, type, sourceFilter);
+
 	  if (!code) return json(await getAssets(env, type, url));
 	  if (!sub)  return json(await getAsset(env, type, code.toUpperCase()));
 	  if (sub === "history") return json(await getHistory(env, type, code.toUpperCase(), url));
@@ -189,11 +191,83 @@ export default {
 	//   fetch: async (env) => { /* ... */ }
 	// },
   
-	// ── Yer Tutucu: BIST ─────────────────────────────────────────────────────
-	// bist: {
-	//   meta: () => ({ id: "bist", name: "Borsa İstanbul", assetTypes: ["stock_tr"], url: "..." }),
-	//   fetch: async (env) => { /* ... */ }
-	// },
+	// ── Borsa İstanbul (TradingView Scanner REST) ─────────────────────────────
+	//
+	// scanner.tradingview.com/turkey/scan → tek POST ile tüm BIST hisseleri.
+	// WebSocket kullanılmaz; Cloudflare Workers ile uyumlu.
+	bist: {
+	  meta: () => ({
+		id: "bist",
+		name: "Borsa İstanbul",
+		assetTypes: ["stock_tr"],
+		url: "https://scanner.tradingview.com/turkey/scan"
+	  }),
+
+	  fetch: async (_env: Env) => {
+		const COLUMNS = ["name", "close", "change", "change_abs", "high", "low", "volume", "market_cap_basic", "description"];
+		const PAGE = 500;
+		const records: ProviderRecord[] = [];
+		let offset = 0;
+
+		while (true) {
+		  const body = {
+			filter: [],
+			options: { lang: "tr" },
+			symbols: { query: { types: [] }, tickers: [] },
+			columns: COLUMNS,
+			sort: { sortBy: "market_cap_basic", sortOrder: "desc" },
+			range: [offset, offset + PAGE]
+		  };
+
+		  const res = await fetch("https://scanner.tradingview.com/turkey/scan", {
+			method: "POST",
+			headers: {
+			  "Content-Type": "application/json",
+			  "User-Agent": "Mozilla/5.0",
+			  "Origin": "https://www.tradingview.com",
+			  "Referer": "https://www.tradingview.com/"
+			},
+			body: JSON.stringify(body)
+		  });
+
+		  if (!res.ok) throw new Error(`TradingView scanner HTTP ${res.status}`);
+
+		  const data = await res.json() as any;
+		  const rows: any[] = data.data ?? [];
+		  if (!rows.length) break;
+
+		  for (const row of rows) {
+			const [tvName, close, change, changeAbs, high, low, volume, marketCap, description] = row.d as any[];
+			// TradingView sembolü "BIST:THYAO" formatında gelir
+			const rawCode = String(tvName ?? "");
+			const code = rawCode.includes(":") ? rawCode.split(":")[1] : rawCode;
+
+			records.push({
+			  assetType: "stock_tr",
+			  source: "bist",
+			  code,
+			  name: description ?? code,
+			  price: toNum(close),
+			  priceDate: todayISO(),
+			  extra: {
+				change_pct: toNum(change),
+				change_abs: toNum(changeAbs),
+				high: toNum(high),
+				low: toNum(low),
+				volume: toNum(volume),
+				market_cap: toNum(marketCap)
+			  }
+			});
+		  }
+
+		  // Son sayfa geldiyse çık
+		  if (rows.length < PAGE) break;
+		  offset += PAGE;
+		}
+
+		return records.filter(r => r.price !== null);
+	  }
+	},
   
 	// ── Yer Tutucu: Amerikan Hisseleri ───────────────────────────────────────
 	// us_stocks: {
@@ -405,27 +479,39 @@ export default {
 	};
   }
   
-  async function refreshBeforeRead(env: Env, assetType: string, sourceId: string | null) {
-	// Bu fonksiyon, /assets isteklerinde DB'yi güncel tutmak için kullanılır.
-	// Hata durumunda okuma yine de yapılır (mevcut DB verisi döner).
+  // TTL_SECONDS: son sync bu süreden eskiyse (veya hiç yoksa) kaynak tekrar sorgulanır.
+  // İstek geldiğinde taze veri varsa DB'den döner, eskiyse provider çağrılır.
+  const REFRESH_TTL_SECONDS = 120;
+
+  async function refreshIfStale(env: Env, assetType: string, sourceId: string | null) {
 	try {
 	  await ensureTables(env);
 
-	  if (sourceId) {
-		const provider = PROVIDERS[sourceId];
-		if (provider && provider.meta().assetTypes.includes(assetType)) {
+	  const providers = sourceId
+		? [PROVIDERS[sourceId]].filter(p => p?.meta().assetTypes.includes(assetType))
+		: Object.values(PROVIDERS).filter(p => p.meta().assetTypes.includes(assetType));
+
+	  for (const provider of providers) {
+		const sid = provider.meta().id;
+
+		// DB'deki en son price_ts'i sorgula
+		const row = await env.DB.prepare(`
+		  SELECT MAX(price_ts) AS last_ts
+		  FROM asset_prices_hourly
+		  WHERE asset_type = ? AND source = ?
+		`).bind(assetType, sid).first() as any;
+
+		const lastTs: string | null = row?.last_ts ?? null;
+		const ageSeconds = lastTs
+		  ? (Date.now() - new Date(lastTs).getTime()) / 1000
+		  : Infinity;
+
+		if (ageSeconds > REFRESH_TTL_SECONDS) {
 		  await runProvider(env, provider);
 		}
-		return;
-	  }
-
-	  const providers = Object.values(PROVIDERS)
-		.filter(p => p.meta().assetTypes.includes(assetType));
-	  for (const p of providers) {
-		await runProvider(env, p);
 	  }
 	} catch (err) {
-	  console.warn("Refresh before read failed:", err);
+	  console.warn("Refresh failed, returning cached data:", err);
 	}
   }
 
@@ -559,7 +645,7 @@ export default {
   const ENDPOINT_DOCS = [
 	"GET /sync/all                          → Tüm kaynakları güncelle",
 	"GET /sync/{source|type}               → Tek kaynak/tip güncelle (örn: altinkaynak_currency, gold, altinkaynak_gold)",
-	"GET /assets/{type}                    → En güncel fiyatlar + değişim % (currency|gold|silver|stock_tr|stock_us|crypto|fund)",
+	"GET /assets/{type}                    → En güncel fiyatlar + değişim % (currency|gold|silver|stock_tr|stock_us|crypto|fund) — stock_tr: tüm BIST hisseleri",
 	"GET /assets/gold                      → Altın fiyatları: kod, ad, alış, satış, değişim % (kaynak: altinkaynak_gold)",
 	"GET /assets/{type}?source={source}    → Kaynağa göre filtrele",
 	"GET /assets/{type}/{code}             → Tek varlık (tüm kaynaklar)",
